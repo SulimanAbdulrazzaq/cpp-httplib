@@ -25614,6 +25614,141 @@ TEST(KeepAliveTest, UnconsumedChunkedBodyIsNotDrainedWhenResponseCloses) {
   EXPECT_EQ(0, received);
 }
 
+// RFC 9112 Section 9.3.2: a client may send several requests without waiting
+// for the responses, and the server answers them in order. The later requests
+// arrive in the same read as the first one, so they have to survive in the
+// connection's buffer until the first response has been sent.
+TEST(KeepAliveTest, PipelinedRequestsAreAllServed) {
+  Server svr;
+  // A dropped request leaves the connection idle until this expires, so keep
+  // it short to make a regression fail quickly.
+  svr.set_keep_alive_timeout(1);
+  svr.Put("/:name", [](const Request &req, Response &res) {
+    res.set_content("put " + req.path_params.at("name") + ":" + req.body,
+                    "text/plain");
+  });
+  svr.Get("/:name", [](const Request &req, Response &res) {
+    res.set_content("get " + req.path_params.at("name"), "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  auto error = Error::Success;
+  auto sock = detail::create_client_socket(
+      HOST, "", port, AF_UNSPEC, false, false, nullptr,
+      /*connection_timeout_sec=*/2, 0,
+      /*read_timeout_sec=*/5, 0,
+      /*write_timeout_sec=*/2, 0, std::string(), error);
+  ASSERT_NE(INVALID_SOCKET, sock);
+  auto sock_se = detail::scope_exit([&] { detail::close_socket(sock); });
+
+  // All three requests go out in one write.
+  const std::string requests = "PUT /first HTTP/1.1\r\n"
+                               "Host: localhost\r\n"
+                               "Content-Length: 1\r\n"
+                               "\r\n"
+                               "a"
+                               "PUT /second HTTP/1.1\r\n"
+                               "Host: localhost\r\n"
+                               "Content-Length: 1\r\n"
+                               "\r\n"
+                               "b"
+                               "GET /third HTTP/1.1\r\n"
+                               "Host: localhost\r\n"
+                               "Connection: close\r\n"
+                               "\r\n";
+  auto sent = send(sock, requests.data(), requests.size(), 0);
+  ASSERT_EQ(static_cast<ssize_t>(requests.size()), sent);
+
+  std::string response;
+  ssize_t received = 0;
+  do {
+    char buf[4096];
+    received = recv(sock, buf, sizeof(buf), 0);
+    if (received > 0) { response.append(buf, static_cast<size_t>(received)); }
+  } while (received > 0);
+
+  auto first = response.find("put first:a");
+  auto second = response.find("put second:b");
+  auto third = response.find("get third");
+  ASSERT_NE(std::string::npos, first) << response;
+  ASSERT_NE(std::string::npos, second) << response;
+  ASSERT_NE(std::string::npos, third) << response;
+  EXPECT_LT(first, second);
+  EXPECT_LT(second, third);
+  EXPECT_EQ(0, received);
+}
+
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+// The same over TLS. The TLS layer, not the socket, holds the requests that
+// follow the first one, so the socket never reports them as readable.
+TEST(KeepAliveTest, PipelinedRequestsAreAllServedSSL) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  svr.set_keep_alive_timeout(1);
+  svr.Get("/:name", [](const Request &req, Response &res) {
+    res.set_content("get " + req.path_params.at("name"), "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  auto error = Error::Success;
+  auto sock = detail::create_client_socket(
+      HOST, "", port, AF_UNSPEC, false, false, nullptr,
+      /*connection_timeout_sec=*/2, 0,
+      /*read_timeout_sec=*/5, 0,
+      /*write_timeout_sec=*/2, 0, std::string(), error);
+  ASSERT_NE(INVALID_SOCKET, sock);
+  auto sock_se = detail::scope_exit([&] { detail::close_socket(sock); });
+
+  auto ctx = SSL_CTX_new(TLS_client_method());
+  ASSERT_NE(nullptr, ctx);
+  auto ctx_se = detail::scope_exit([&] { SSL_CTX_free(ctx); });
+  auto ssl = SSL_new(ctx);
+  ASSERT_NE(nullptr, ssl);
+  auto ssl_se = detail::scope_exit([&] { SSL_free(ssl); });
+  SSL_set_fd(ssl, static_cast<int>(sock));
+  ASSERT_EQ(1, SSL_connect(ssl));
+
+  // Both requests go out in one TLS record.
+  const std::string requests = "GET /first HTTP/1.1\r\n"
+                               "Host: localhost\r\n"
+                               "\r\n"
+                               "GET /second HTTP/1.1\r\n"
+                               "Host: localhost\r\n"
+                               "Connection: close\r\n"
+                               "\r\n";
+  ASSERT_EQ(static_cast<int>(requests.size()),
+            SSL_write(ssl, requests.data(), static_cast<int>(requests.size())));
+
+  std::string response;
+  for (;;) {
+    char buf[4096];
+    auto n = SSL_read(ssl, buf, sizeof(buf));
+    if (n <= 0) { break; }
+    response.append(buf, static_cast<size_t>(n));
+  }
+
+  auto first = response.find("get first");
+  auto second = response.find("get second");
+  ASSERT_NE(std::string::npos, first) << response;
+  ASSERT_NE(std::string::npos, second) << response;
+  EXPECT_LT(first, second);
+}
+#endif
+
 namespace no_proxy_test {
 
 // Server bound to 127.0.0.1:<dynamic>, listen thread spawned by listen(),
