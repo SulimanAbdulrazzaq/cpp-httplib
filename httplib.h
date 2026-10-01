@@ -6608,15 +6608,24 @@ inline bool keep_alive(const std::atomic<socket_t> &svr_sock, socket_t sock,
   return false;
 }
 
-template <typename T>
+template <typename StreamType, typename T>
 inline bool
 process_server_socket_core(const std::atomic<socket_t> &svr_sock, socket_t sock,
-                           size_t keep_alive_max_count,
+                           StreamType &strm, size_t keep_alive_max_count,
                            time_t keep_alive_timeout_sec, T callback) {
   assert(keep_alive_max_count > 0);
   auto ret = false;
   auto count = keep_alive_max_count;
-  while (count > 0 && keep_alive(svr_sock, sock, keep_alive_timeout_sec)) {
+  while (count > 0) {
+    // A client may pipeline its requests (RFC 9112 Section 9.3.2). Reading one
+    // request can pull the next one into the stream's buffer, or into the TLS
+    // layer, where the socket no longer reports it as readable. Look there
+    // before waiting on the socket.
+    if (!strm.is_readable()) {
+      if (!keep_alive(svr_sock, sock, keep_alive_timeout_sec)) { break; }
+      // keep_alive() has just seen the socket go readable.
+      strm.set_readable_hint();
+    }
     auto close_connection = count == 1;
     auto connection_closed = false;
     ret = callback(close_connection, connection_closed);
@@ -6633,14 +6642,13 @@ process_server_socket(const std::atomic<socket_t> &svr_sock, socket_t sock,
                       time_t keep_alive_timeout_sec, time_t read_timeout_sec,
                       time_t read_timeout_usec, time_t write_timeout_sec,
                       time_t write_timeout_usec, T callback) {
+  // One stream serves every request on the connection, so bytes read ahead
+  // while parsing one request are still there for the next.
+  SocketStream strm(sock, read_timeout_sec, read_timeout_usec,
+                    write_timeout_sec, write_timeout_usec);
   return process_server_socket_core(
-      svr_sock, sock, keep_alive_max_count, keep_alive_timeout_sec,
+      svr_sock, sock, strm, keep_alive_max_count, keep_alive_timeout_sec,
       [&](bool close_connection, bool &connection_closed) {
-        SocketStream strm(sock, read_timeout_sec, read_timeout_usec,
-                          write_timeout_sec, write_timeout_usec);
-        // process_server_socket_core() only gets here once keep_alive() has
-        // seen the socket go readable.
-        strm.set_readable_hint();
         return callback(strm, close_connection, connection_closed);
       });
 }
@@ -10555,13 +10563,12 @@ inline bool process_server_socket_ssl(
     socket_t sock, size_t keep_alive_max_count, time_t keep_alive_timeout_sec,
     time_t read_timeout_sec, time_t read_timeout_usec, time_t write_timeout_sec,
     time_t write_timeout_usec, T callback) {
+  // See the non-TLS path in process_server_socket().
+  SSLSocketStream strm(sock, session, read_timeout_sec, read_timeout_usec,
+                       write_timeout_sec, write_timeout_usec);
   return process_server_socket_core(
-      svr_sock, sock, keep_alive_max_count, keep_alive_timeout_sec,
+      svr_sock, sock, strm, keep_alive_max_count, keep_alive_timeout_sec,
       [&](bool close_connection, bool &connection_closed) {
-        SSLSocketStream strm(sock, session, read_timeout_sec, read_timeout_usec,
-                             write_timeout_sec, write_timeout_usec);
-        // See the non-TLS path in process_server_socket().
-        strm.set_readable_hint();
         return callback(strm, close_connection, connection_closed);
       });
 }
