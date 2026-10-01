@@ -1,0 +1,88 @@
+name: s15-verify
+on: push
+
+env:
+  GTEST_FILTER: '-*_Online'
+
+jobs:
+  openssl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      LSAN_OPTIONS: suppressions=lsan_suppressions.txt
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 4
+      - name: tree under test (the commit below the CI commit is the one tested)
+        run: git log -3 --format='%H %T %s'
+      - name: install libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev zlib1g-dev libbrotli-dev libzstd-dev libssl-dev
+      - name: build split header and run the full suite (OpenSSL)
+        run: cd test && make test_split && make test_openssl_parallel
+      - name: new tests by name (OpenSSL)
+        if: always()
+        run: cd test && ./test_split --gtest_filter='KeepAliveTest.Pipelined*' --gtest_color=no
+      - name: ThreadPool test
+        run: cd test && make test_thread_pool && ./test_thread_pool
+
+  mbedtls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 4
+      - name: tree under test
+        run: git log -3 --format='%H %T %s'
+      - name: install libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev zlib1g-dev libbrotli-dev libzstd-dev libmbedtls-dev
+      - name: build split header and run the full suite (Mbed TLS)
+        run: cd test && make test_split_mbedtls && make test_mbedtls_parallel
+      - name: new tests by name (Mbed TLS)
+        if: always()
+        run: cd test && ./test_split_mbedtls --gtest_filter='KeepAliveTest.Pipelined*' --gtest_color=no
+
+  wolfssl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 4
+      - name: tree under test
+        run: git log -3 --format='%H %T %s'
+      - name: install libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev zlib1g-dev libbrotli-dev libzstd-dev libwolfssl-dev
+      - name: build split header and run the full suite (wolfSSL)
+        run: cd test && make test_split_wolfssl && make test_wolfssl_parallel
+      - name: new tests by name (wolfSSL)
+        if: always()
+        run: cd test && ./test_split_wolfssl --gtest_filter='KeepAliveTest.Pipelined*' --gtest_color=no
+
+  style:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 4
+      - name: tree under test
+        run: git log -3 --format='%H %T %s'
+      - name: clang-format on the changed lines
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format
+          clang-format --version
+          ls /usr/bin | grep -i clang-format || true
+          GCF=$(ls /usr/bin/git-clang-format* | head -1)
+          echo "using $GCF"
+          $GCF --diff --extensions h,cc HEAD~2 -- httplib.h test/test.cc | tee style.diff
+          ! grep -q '^@@' style.diff
